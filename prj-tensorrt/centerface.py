@@ -6,6 +6,38 @@ import pycuda.driver as cuda
 import tensorrt as trt
 
 
+class HostDeviceMem(object):
+    def __init__(self, host_mem, device_mem):
+        self.host = host_mem
+        self.device = device_mem
+
+    def __str__(self):
+        return "Host:\n" + str(self.host) + "\nDevice:\n" + str(self.device)
+
+    def __repr__(self):
+        return self.__str__()
+
+def allocate_buffers(engine):
+    inputs = []
+    outputs = []
+    bindings = []
+    stream = cuda.Stream()
+    for binding in engine:
+        size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
+        dtype = trt.nptype(engine.get_binding_dtype(binding))
+        # Allocate host and device buffers
+        host_mem = cuda.pagelocked_empty(size, dtype)
+        device_mem = cuda.mem_alloc(host_mem.nbytes)
+        # Append the device buffer to device bindings.
+        bindings.append(int(device_mem))
+        # Append to the appropriate list.
+        if engine.binding_is_input(binding):
+            inputs.append(HostDeviceMem(host_mem, device_mem))
+        else:
+            outputs.append(HostDeviceMem(host_mem, device_mem))
+    return inputs, outputs, bindings, stream
+
+
 class CenterFace(object):
     def __init__(self, landmarks=True):
         self.landmarks = landmarks
@@ -13,6 +45,10 @@ class CenterFace(object):
         f = open("../models/tensorrt/centerface.trt", "rb")
         runtime = trt.Runtime(self.trt_logger)
         self.net = runtime.deserialize_cuda_engine(f.read())
+        # Create the context for this engine
+        self.context = self.net.create_execution_context()
+        # Allocate buffers for input and output
+        self.inputs, self.outputs, self.bindings, self.stream = allocate_buffers(self.net)
         self.img_h_new, self.img_w_new, self.scale_h, self.scale_w = 0, 0, 0, 0
 
     def __call__(self, img, height, width, threshold=0.5):
@@ -21,58 +57,8 @@ class CenterFace(object):
         return self.inference_tensorrt(img, threshold)
 
     def inference_tensorrt(self, img, threshold):
-
-        class HostDeviceMem(object):
-            def __init__(self, host_mem, device_mem):
-                self.host = host_mem
-                self.device = device_mem
-
-            def __str__(self):
-                return "Host:\n" + str(self.host) + "\nDevice:\n" + str(self.device)
-
-            def __repr__(self):
-                return self.__str__()
-
-        def allocate_buffers(engine):
-            inputs = []
-            outputs = []
-            bindings = []
-            stream = cuda.Stream()
-            for binding in engine:
-                size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
-                dtype = trt.nptype(engine.get_binding_dtype(binding))
-                # Allocate host and device buffers
-                host_mem = cuda.pagelocked_empty(size, dtype)
-                device_mem = cuda.mem_alloc(host_mem.nbytes)
-                # Append the device buffer to device bindings.
-                bindings.append(int(device_mem))
-                # Append to the appropriate list.
-                if engine.binding_is_input(binding):
-                    inputs.append(HostDeviceMem(host_mem, device_mem))
-                else:
-                    outputs.append(HostDeviceMem(host_mem, device_mem))
-            return inputs, outputs, bindings, stream
-
-        def do_inference(context, bindings, inputs, outputs, stream, batch_size=1):
-            # Transfer data from CPU to the GPU.
-            [cuda.memcpy_htod_async(inp.device, inp.host, stream) for inp in inputs]
-            # Run inference.
-            context.execute_async(batch_size=batch_size, bindings=bindings, stream_handle=stream.handle)
-            # Transfer predictions back from the GPU.
-            [cuda.memcpy_dtoh_async(out.host, out.device, stream) for out in outputs]
-            # Synchronize the stream
-            stream.synchronize()
-            # Return only the host outputs.
-            return [out.host for out in outputs]
-
         image_cv = cv2.resize(img, dsize=(self.img_w_new, self.img_h_new))
         blob = np.expand_dims(image_cv[:, :, (2, 1, 0)].transpose(2, 0, 1), axis=0).astype("float32")
-        engine = self.net
-
-        # Create the context for this engine
-        context = engine.create_execution_context()
-        # Allocate buffers for input and output
-        inputs, outputs, bindings, stream = allocate_buffers(engine)  # input, output: host # bindings
 
         # Do inference
         shape_of_output = [(1, 1, int(self.img_h_new / 4), int(self.img_w_new / 4)),
@@ -80,9 +66,9 @@ class CenterFace(object):
                            (1, 2, int(self.img_h_new / 4), int(self.img_w_new / 4)),
                            (1, 10, int(self.img_h_new / 4), int(self.img_w_new / 4))]
         # Load data to the buffer
-        inputs[0].host = blob.reshape(-1)
+        self.inputs[0].host = blob.reshape(-1)
         begin = datetime.datetime.now()
-        trt_outputs = do_inference(context, bindings=bindings, inputs=inputs, outputs=outputs, stream=stream)  # numpy data
+        trt_outputs = do_inference(self.context, bindings=self.bindings, inputs=self.inputs, outputs=self.outputs, stream=self.stream)  # numpy data
         end = datetime.datetime.now()
         print("gpu times = ", end - begin)
 
@@ -183,3 +169,17 @@ class CenterFace(object):
                     suppressed[j] = True
 
         return keep
+
+# This function is generalized for multiple inputs/outputs.
+# inputs and outputs are expected to be lists of HostDeviceMem objects.
+def do_inference(context, bindings, inputs, outputs, stream, batch_size=1):
+    # Transfer input data to the GPU.
+    [cuda.memcpy_htod_async(inp.device, inp.host, stream) for inp in inputs]
+    # Run inference.
+    context.execute_async(batch_size=batch_size, bindings=bindings, stream_handle=stream.handle)
+    # Transfer predictions back from the GPU.
+    [cuda.memcpy_dtoh_async(out.host, out.device, stream) for out in outputs]
+    # Synchronize the stream
+    stream.synchronize()
+    # Return only the host outputs.
+    return [out.host for out in outputs]
