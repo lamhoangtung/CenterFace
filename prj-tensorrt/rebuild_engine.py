@@ -55,4 +55,4 @@ def get_engine(max_batch_size=1, onnx_file_path="", engine_file_path="", fp16_mo
     else:
         return build_engine(max_batch_size, save_engine)
 
-engine = get_engine(max_batch_size=1, onnx_file_path="sim_centerface.onnx", engine_file_path="new_centerface.trt", save_engine=True)
+engine = get_engine(max_batch_size=1, onnx_file_path="models/onnx/centerface_1088_1920.onnx", engine_file_path="models/tensorrt/centerface.trt", save_engine=True)
