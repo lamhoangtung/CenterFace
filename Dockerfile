@@ -5,3 +5,4 @@ RUN python3 -m pip install -r /tmp/requirements.txt
 
 COPY . /workspace/
 WORKDIR /workspace
+ENTRYPOINT init_engine.sh && /bin/bash
